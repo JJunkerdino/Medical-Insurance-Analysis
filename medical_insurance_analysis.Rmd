@@ -1,0 +1,708 @@
+---
+title: "Medical Insurance: Who Becomes a High-Cost Patient?"
+output:
+  github_document:
+    toc: true
+    html_preview: false
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, fig.path = "figures/",
+  fig.width = 7, fig.height = 4.2, dpi = 150
+)
+```
+
+## 1. Goal
+
+Medical costs are very different from person to person. An insurance company
+wants to know **who is likely to be expensive**, so it can set fair prices and
+plan for risk.
+
+In this project we:
+
+1. Label each person as **high cost** if their yearly medical charges are in the
+   **top 30%**.
+2. Build **logistic regression** models (a GLM with a binomial family) that
+   predict the chance of being high cost from age, sex, BMI, number of
+   children, smoking and region.
+3. Compare 7 models with **AIC** and **10-fold cross-validation**, choose the
+   best one and explain what it tells us.
+
+## 2. Data
+
+The data comes from Kaggle:
+[Medical Insurance Price Prediction](https://www.kaggle.com/datasets/harishkumardatalab/medical-insurance-price-prediction).
+
+| Column     | Meaning                                                  | Type     |
+|------------|----------------------------------------------------------|----------|
+| `age`      | Age of the person (years)                                | number   |
+| `sex`      | `female` or `male`                                       | category |
+| `bmi`      | Body Mass Index = weight (kg) / height (m)²              | number   |
+| `children` | Number of children covered by the insurance              | number   |
+| `smoker`   | `yes` or `no`                                            | category |
+| `region`   | Home region in the US: `northeast`, `northwest`, `southeast`, `southwest` | category |
+| `charges`  | Yearly medical costs billed by the insurance (USD)       | number   |
+
+```{r libraries}
+library(MASS)      # stepAIC()
+library(bestglm)   # best subset selection
+library(pROC)      # ROC curve and AUC
+library(dplyr)     # loaded after MASS so that dplyr::select() is not masked
+library(ggplot2)
+library(scales)
+
+theme_set(theme_minimal(base_size = 12))
+smoker_colours    <- c(no = "#7FA7C9", yes = "#D1495B")
+high_cost_colours <- c(No = "#A0A0A0", Yes = "#E08E2B")
+```
+
+```{r load-data}
+raw <- read.csv("data/Medical_insurance.csv", stringsAsFactors = FALSE)
+dim(raw)
+head(raw)
+```
+
+## 3. Data cleaning
+
+### 3.1 Missing values
+
+```{r missing-values}
+colSums(is.na(raw))
+```
+
+There are no missing values.
+
+### 3.2 Duplicate rows
+
+```{r duplicates}
+sum(duplicated(raw))
+
+# How many times does each different row appear in the file?
+raw %>%
+  count(across(everything()), name = "times_in_file") %>%
+  count(times_in_file, name = "different_rows")
+```
+
+`r comma(sum(duplicated(raw)))` of the `r comma(nrow(raw))` rows
+(`r percent(mean(duplicated(raw)), 1)`) are **exact copies** of another row.
+Every column is the same, even `charges` with 5 decimals. Every different row
+appears 2 or 4 times, so the file really has only
+**`r comma(nrow(distinct(raw)))` different people**.
+
+Why this is a problem:
+
+- The model thinks it has twice as much data as it really has, so p-values
+  look stronger than they are.
+- In cross-validation, a copy of a test person can also be in the training
+  data. The model has already "seen the answer", so test scores look better
+  than they really are.
+
+So we keep only one copy of each row.
+
+```{r remove-duplicates}
+ins <- distinct(raw)
+nrow(ins)
+```
+
+### 3.3 Target variable: `high_cost`
+
+```{r target}
+cut_70 <- quantile(ins$charges, 0.70)
+cut_70
+
+ins <- ins %>%
+  mutate(
+    high_cost = factor(ifelse(charges >= cut_70, "Yes", "No"), levels = c("No", "Yes")),
+    sex       = factor(sex),
+    smoker    = factor(smoker),
+    region    = factor(region)
+  )
+
+ins %>%
+  count(high_cost) %>%
+  mutate(percent = percent(n / sum(n), accuracy = 0.1))
+```
+
+A person is **high cost** if their charges are at least
+**$`r comma(cut_70, accuracy = 0.01)`** (the 70th percentile).
+
+- R uses the first level of each category as the **reference group**:
+  `female`, `no` (non-smoker) and `northeast`.
+- **Baseline:** if we always guess "No", we are right
+  `r percent(mean(ins$high_cost == "No"), 0.1)` of the time. A useful model
+  must beat this **70% baseline**.
+
+## 4. Exploratory data analysis
+
+### 4.1 High-cost rate by group
+
+```{r rate-by-group}
+rate_by <- function(var) {
+  ins %>%
+    group_by(group = as.character(.data[[var]])) %>%
+    summarise(people = n(), high_cost = sum(high_cost == "Yes"), .groups = "drop") %>%
+    mutate(variable = var, high_cost_rate = percent(high_cost / people, 0.1)) %>%
+    select(variable, group, people, high_cost, high_cost_rate)
+}
+
+bind_rows(rate_by("smoker"), rate_by("sex"), rate_by("region"))
+```
+
+- **Smoking** makes the biggest difference: almost every smoker is high cost.
+- **Sex** makes only a small difference.
+- **Region:** the southwest has the lowest rate and the southeast the highest.
+
+### 4.2 Smoking status by cost group
+
+```{r plot-smoker-by-cost}
+ggplot(ins, aes(x = high_cost, fill = smoker)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = label_percent()) +
+  scale_fill_manual(values = smoker_colours) +
+  labs(title = "Smoking status by cost group",
+       x = "High cost?", y = "Share of people", fill = "Smoker")
+```
+
+In the low-cost group almost nobody smokes
+(`r percent(mean(ins$smoker[ins$high_cost == "No"] == "yes"), 0.1)`).
+In the high-cost group most people smoke
+(`r percent(mean(ins$smoker[ins$high_cost == "Yes"] == "yes"), 0.1)`).
+
+### 4.3 Sex by cost group
+
+```{r plot-sex-by-cost}
+ggplot(ins, aes(x = high_cost, fill = sex)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title = "Sex by cost group",
+       x = "High cost?", y = "Share of people", fill = "Sex")
+```
+
+The male/female mix is almost the same in both groups (men:
+`r percent(mean(ins$sex[ins$high_cost == "No"] == "male"), 0.1)` of the
+low-cost group and
+`r percent(mean(ins$sex[ins$high_cost == "Yes"] == "male"), 0.1)` of the
+high-cost group). Sex does not look important.
+
+### 4.4 Smoking status by region
+
+```{r plot-smoker-by-region}
+ggplot(ins, aes(x = region, fill = smoker)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = label_percent()) +
+  scale_fill_manual(values = smoker_colours) +
+  labs(title = "Smoking status by region",
+       x = "Region", y = "Share of people", fill = "Smoker")
+```
+
+```{r smoking-rate-by-region}
+ins %>%
+  group_by(region) %>%
+  summarise(smokers = percent(mean(smoker == "yes"), 0.1))
+```
+
+Smoking rates are similar in all regions. The southeast has a few more
+smokers, which partly explains its higher high-cost rate.
+
+### 4.5 Charges by smoking status
+
+```{r plot-charges-by-smoker}
+ggplot(ins, aes(x = smoker, y = charges, fill = smoker)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_y_continuous(labels = label_dollar()) +
+  scale_fill_manual(values = smoker_colours) +
+  labs(title = "Charges by smoking status", x = "Smoker", y = "Charges (USD)") +
+  theme(legend.position = "none")
+```
+
+The median charge of smokers is
+$`r comma(median(ins$charges[ins$smoker == "yes"]))`, about
+`r round(median(ins$charges[ins$smoker == "yes"]) / median(ins$charges[ins$smoker == "no"]), 1)`
+times the median of non-smokers
+($`r comma(median(ins$charges[ins$smoker == "no"]))`). Smokers' charges are
+also much more spread out.
+
+### 4.6 Charges by cost group
+
+```{r plot-charges-by-cost}
+ggplot(ins, aes(x = high_cost, y = charges, fill = high_cost)) +
+  geom_boxplot(alpha = 0.8) +
+  geom_hline(yintercept = cut_70, linetype = "dashed") +
+  scale_y_continuous(labels = label_dollar()) +
+  scale_fill_manual(values = high_cost_colours) +
+  labs(title = "Charges by cost group (dashed line = cutoff)",
+       x = "High cost?", y = "Charges (USD)") +
+  theme(legend.position = "none")
+```
+
+This checks that the target was made correctly: every "No" is below the
+cutoff and every "Yes" is above it. The high-cost group is also much more
+spread out (from $`r comma(min(ins$charges[ins$high_cost == "Yes"]))` to
+$`r comma(max(ins$charges[ins$high_cost == "Yes"]))`).
+
+### 4.7 BMI by sex
+
+```{r plot-bmi-by-sex}
+ggplot(ins, aes(x = sex, y = bmi, fill = sex)) +
+  geom_boxplot(alpha = 0.8) +
+  labs(title = "BMI by sex", x = "Sex", y = "BMI") +
+  theme(legend.position = "none")
+```
+
+BMI looks almost the same for women (median
+`r round(median(ins$bmi[ins$sex == "female"]), 1)`) and men (median
+`r round(median(ins$bmi[ins$sex == "male"]), 1)`). Both groups have some very
+high BMI values.
+
+### 4.8 Charges by age and smoking status
+
+```{r plot-charges-by-age}
+ggplot(ins, aes(x = age, y = charges, colour = smoker)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = cut_70, linetype = "dashed") +
+  annotate("text", x = 36, y = cut_70, label = "high-cost cutoff",
+           hjust = 0, vjust = 1.5, size = 3.5) +
+  scale_y_continuous(labels = label_dollar()) +
+  scale_colour_manual(values = smoker_colours) +
+  labs(title = "Charges by age and smoking status",
+       x = "Age", y = "Charges (USD)", colour = "Smoker")
+```
+
+This plot explains most of the project:
+
+- Almost all smokers are above the cutoff line.
+- For most non-smokers, charges grow slowly with age and only reach the
+  cutoff line at around age 60.
+- A small group of non-smokers is expensive at any age. Nothing in the data
+  explains why.
+
+So the link between age and high cost is **not a straight line**: for
+non-smokers, the chance stays low for a long time and then jumps up at older
+ages. This is why we also try curved terms (age², age³) in the models.
+
+## 5. Logistic regression models
+
+Logistic regression models the probability $p$ that a person is high cost:
+
+$$\log\left(\frac{p}{1-p}\right) = \beta_0 + \beta_1 x_1 + \beta_2 x_2 + \dots$$
+
+- A positive coefficient means a higher chance of high cost.
+- $e^{\beta}$ is the **odds ratio**: how many times the odds change when $x$
+  goes up by 1.
+
+We compare models with **AIC** (Akaike Information Criterion):
+AIC = −2 × log-likelihood + 2 × (number of parameters).
+A lower AIC means a better balance between fitting the data well and keeping
+the model simple.
+
+| Model | Idea | Terms |
+|---|---|---|
+| M1 Full | Main effects + BMI² + interactions with smoking | age, bmi, bmi², children, sex, smoker, region, smoker × bmi, smoker × age |
+| M2 Reduced | M1 without the interactions | age, bmi, bmi², children, sex, smoker, region |
+| M3 Quadratic | M2 + age² | M2 + age² |
+| M4 Cubic | M3 + age³ + bmi³ | M3 + age³, bmi³ |
+| M5 Stepwise AIC | Backward selection starting from M4 | chosen by AIC |
+| M6 bestglm (AIC) | Try every subset of the main effects | chosen by AIC |
+| M7 bestglm (CV) | Try every subset of the main effects | chosen by 10-fold CV |
+
+### 5.1 M1: Full model
+
+```{r m1-full}
+m1_full <- glm(
+  high_cost ~ age + bmi + I(bmi^2) + children + sex + smoker + region +
+    smoker:bmi + smoker:age,
+  data = ins, family = binomial
+)
+
+m1_full$converged
+round(coef(summary(m1_full)), 3)
+```
+
+**M1 does not work.** R warns that the algorithm did not converge, and the
+smoker terms have huge coefficients (`smokeryes` =
+`r comma(coef(m1_full)[["smokeryes"]])`) with huge standard errors. This
+problem is called **separation**. Here is the reason:
+
+```{r low-cost-smokers}
+ins %>% filter(smoker == "yes", high_cost == "No")
+```
+
+Only `r sum(ins$smoker == "yes" & ins$high_cost == "No")` of the
+`r sum(ins$smoker == "yes")` smokers are **not** high cost, and both are
+18-year-old men with a low BMI. With the interaction terms, smokers get their
+own age and BMI slopes, so the model can draw a line that separates these 2
+people perfectly from the other smokers. To make this "perfect", the
+coefficients keep growing and the fit never finishes.
+
+So the coefficients, p-values and AIC of M1 **cannot be trusted**, and M1 cannot
+be the final model. It also tells us that this data is too small to estimate
+smoker × age or smoker × BMI effects for a yes/no high-cost target.
+
+### 5.2 M2, M3, M4: Reduced, quadratic and cubic models
+
+```{r m2-m4}
+m2_reduced <- glm(
+  high_cost ~ age + bmi + I(bmi^2) + children + sex + smoker + region,
+  data = ins, family = binomial
+)
+
+m3_quadratic <- glm(
+  high_cost ~ age + I(age^2) + bmi + I(bmi^2) + children + sex + smoker + region,
+  data = ins, family = binomial
+)
+
+m4_cubic <- glm(
+  high_cost ~ age + I(age^2) + I(age^3) + bmi + I(bmi^2) + I(bmi^3) +
+    children + sex + smoker + region,
+  data = ins, family = binomial
+)
+
+c(m2 = m2_reduced$converged, m3 = m3_quadratic$converged, m4 = m4_cubic$converged)
+AIC(m2_reduced, m3_quadratic, m4_cubic)
+```
+
+- Without the interactions, the separation problem is gone: all three models
+  converge.
+- Adding age² (M3) lowers the AIC a lot, and adding age³ and bmi³ (M4) lowers
+  it again. This matches the plot in 4.8: the effect of age is curved.
+
+### 5.3 M5: Stepwise AIC
+
+Backward stepwise selection starts from a big model and removes one term at a
+time, as long as the AIC goes down. We start from **M4**, the largest model
+that converges. (Starting from M1 is not useful, because its AIC is not
+reliable.)
+
+```{r m5-stepwise}
+m5_stepwise <- stepAIC(m4_cubic, direction = "backward", trace = FALSE)
+m5_stepwise$anova
+formula(m5_stepwise)
+```
+
+Stepwise removes only `bmi³`. Removing any other term would not lower the AIC.
+
+### 5.4 M6 and M7: best subset selection with `bestglm`
+
+`bestglm` fits **every possible subset** of the main effects
+(2⁸ = 256 models) and picks the best one. It needs a data frame with only
+numbers and the outcome `y` in the last column, so we turn each category into
+0/1 columns. Region gets 3 columns because `northeast` is the reference group.
+
+```{r bestglm-data}
+ins_best <- ins %>%
+  transmute(
+    age, bmi, children,
+    sex_male   = as.integer(sex == "male"),
+    smoker_yes = as.integer(smoker == "yes"),
+    reg_nw     = as.integer(region == "northwest"),
+    reg_se     = as.integer(region == "southeast"),
+    reg_sw     = as.integer(region == "southwest"),
+    y          = as.integer(high_cost == "Yes")
+  )
+```
+
+**M6: best subset by AIC**
+
+```{r m6-bestglm-aic}
+best_aic <- bestglm(ins_best, family = binomial, IC = "AIC",
+                    method = "exhaustive", TopModels = 5)
+best_aic$BestModels
+
+# Refit the chosen subset as a normal glm on ins_best (needed for cross-validation later)
+m6_best_aic <- glm(formula(best_aic$BestModel), data = ins_best, family = binomial)
+print(formula(m6_best_aic), showEnv = FALSE)
+```
+
+The table shows the top 5 subsets. (bestglm's `Criterion` does not count the
+intercept, so it is exactly 2 lower than R's `AIC()`.)
+
+**M7: best subset by 10-fold cross-validation**
+
+```{r m7-bestglm-cv}
+set.seed(999)
+best_cv <- bestglm(ins_best, family = binomial, IC = "CV",
+                   CVArgs = list(Method = "HTF", K = 10, REP = 1),
+                   method = "exhaustive")
+m7_best_cv <- glm(formula(best_cv$BestModel), data = ins_best, family = binomial)
+print(formula(m7_best_cv), showEnv = FALSE)
+```
+
+The HTF method uses the **one-standard-error rule**: it picks the simplest
+model whose CV error is close to the best one. That is why M7 keeps only age
+and smoker.
+
+## 6. Model comparison
+
+AIC measures the fit on the data that the model was trained on. To check how
+well each model predicts **new people**, we use **10-fold cross-validation
+(CV)**:
+
+1. Split the `r comma(nrow(ins))` people into 10 random groups (folds).
+2. Train the model on 9 folds and predict the 10th fold.
+3. Repeat 10 times, so every person gets one prediction from a model that
+   never saw them.
+
+All models use the **same folds**, so the comparison is fair. We then compute:
+
+- **Accuracy:** share of correct yes/no predictions (predict "Yes" when the
+  probability is 0.5 or more).
+- **AUC:** the chance that the model gives a random high-cost person a higher
+  probability than a random low-cost person (1 = perfect, 0.5 = coin flip).
+
+```{r cross-validation}
+models <- list(
+  "M1 Full (interactions)" = m1_full,
+  "M2 Reduced"             = m2_reduced,
+  "M3 Quadratic"           = m3_quadratic,
+  "M4 Cubic"               = m4_cubic,
+  "M5 Stepwise AIC"        = m5_stepwise,
+  "M6 bestglm (AIC)"       = m6_best_aic,
+  "M7 bestglm (CV)"        = m7_best_cv
+)
+
+set.seed(999)
+folds  <- sample(rep(1:10, length.out = nrow(ins)))
+actual <- as.integer(ins$high_cost == "Yes")
+
+# Out-of-fold probability for every person
+cv_predict <- function(model) {
+  data <- model$data
+  pred <- numeric(nrow(data))
+  for (k in 1:10) {
+    test <- folds == k
+    fit  <- suppressWarnings(glm(formula(model), data = data[!test, ], family = binomial))
+    pred[test] <- predict(fit, newdata = data[test, ], type = "response")
+  }
+  pred
+}
+
+cv_pred <- lapply(models, cv_predict)
+
+comparison <- data.frame(
+  model       = names(models),
+  parameters  = sapply(models, function(m) length(coef(m))),
+  converged   = sapply(models, function(m) m$converged),
+  AIC         = round(sapply(models, AIC), 1),
+  cv_accuracy = percent(sapply(cv_pred, function(p) mean((p >= 0.5) == actual)), 0.1),
+  cv_auc      = round(sapply(cv_pred, function(p) {
+    as.numeric(auc(actual, p, levels = c(0, 1), direction = "<", quiet = TRUE))
+  }), 3),
+  nonsmokers_predicted_high = sapply(cv_pred, function(p) sum(p >= 0.5 & ins$smoker == "no")),
+  row.names   = NULL
+)
+comparison
+```
+
+**Two simple rules to compare with:**
+
+- Always guess "No": `r percent(mean(actual == 0), 0.1)` accuracy.
+- Guess "Yes" only for smokers:
+  `r percent(mean((ins$smoker == "yes") == (actual == 1)), 0.1)` accuracy.
+
+What we learn:
+
+- **M1, M2, M6 and M7 are only as good as the smoker rule** (90.2–90.3%
+  accuracy). With a straight-line age effect, they (almost) never predict
+  "high cost" for a non-smoker (last column), so in practice they just say
+  "Yes" for smokers (see 7.2).
+- **The curved-age models (M3, M4, M5) are clearly better** (92.4–92.5%
+  accuracy and a higher AUC). The curve lets them also flag older
+  non-smokers. The differences among these three are only 1 or 2 people.
+- **M5 has the lowest AIC** of all models that converge, and its CV scores are
+  almost the same as the best ones.
+
+**Final model: M5 (Stepwise AIC).**
+
+## 7. Final model
+
+```{r final-summary}
+final_model <- m5_stepwise
+summary(final_model)
+```
+
+### 7.1 Odds ratios
+
+```{r odds-ratios}
+or_table <- exp(cbind(odds_ratio = coef(final_model), confint(final_model)))
+round(or_table[c("children", "sexmale", "smokeryes",
+                 "regionnorthwest", "regionsoutheast", "regionsouthwest"), ], 2)
+```
+
+An odds ratio above 1 means higher odds of high cost; below 1 means lower odds.
+If the 95% interval includes 1, the effect is not clear.
+
+- **Smoker:** the odds are about `r comma(or_table["smokeryes", 1])` times
+  higher. This number is extreme because
+  `r sum(ins$smoker == "yes" & ins$high_cost == "Yes")` of
+  `r sum(ins$smoker == "yes")` smokers are high cost, so the exact size is very
+  uncertain (wide interval). But it is clearly the strongest factor.
+- **Children:** each extra child multiplies the odds by
+  `r round(or_table["children", 1], 2)`
+  (+`r percent(or_table["children", 1] - 1, 1)`).
+- **Region:** people in the southwest have
+  `r percent(1 - or_table["regionsouthwest", 1], 1)` lower odds than people in
+  the northeast. Northwest and southeast are not clearly different.
+- **Sex:** the interval includes 1, so there is no clear difference between men
+  and women.
+- **Age and BMI** are curved (several terms work together), so single odds
+  ratios are hard to read. We show age in a plot below. For BMI, the model
+  says the chance goes up until a BMI of about
+  `r round(-coef(final_model)[["bmi"]] / (2 * coef(final_model)[["I(bmi^2)"]]), 1)`
+  and then goes down a little. This effect is much smaller than smoking or
+  age.
+
+### 7.2 Effect of age for non-smokers
+
+For smokers, the chance of high cost is almost 100% at every age, so age
+matters mostly for **non-smokers**. The points below show the real share of
+high-cost non-smokers at each age. The lines show the average predicted
+probability (models fitted on all the data) of a model with a straight-line
+age effect (M2) and of the final model (M5).
+
+```{r plot-age-effect}
+nonsmokers <- ins %>%
+  mutate(p_linear = fitted(m2_reduced), p_final = fitted(final_model)) %>%
+  filter(smoker == "no")
+
+age_effect <- nonsmokers %>%
+  group_by(age) %>%
+  summarise(observed = mean(high_cost == "Yes"),
+            p_linear = mean(p_linear),
+            p_final  = mean(p_final))
+
+ggplot(age_effect, aes(x = age)) +
+  geom_point(aes(y = observed), colour = "grey40") +
+  geom_line(aes(y = p_linear, colour = "M2: straight-line age"), linewidth = 1) +
+  geom_line(aes(y = p_final, colour = "M5 (final): curved age"), linewidth = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  scale_y_continuous(labels = label_percent()) +
+  scale_colour_manual(values = c("#7FA7C9", "#D1495B")) +
+  labs(title = "Non-smokers: chance of high cost by age",
+       subtitle = "Points = real share at each age. Lines = average model prediction.",
+       x = "Age", y = "Chance of high cost", colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+```{r nonsmokers-predicted-high}
+nonsmokers %>%
+  summarise(
+    highest_chance_M2 = percent(max(p_linear), 0.1),
+    predicted_high_M2 = sum(p_linear >= 0.5),
+    highest_chance_M5 = percent(max(p_final), 0.1),
+    predicted_high_M5 = sum(p_final >= 0.5),
+    youngest_predicted_high_M5 = min(age[p_final >= 0.5])
+  )
+```
+
+- For non-smokers, the real chance of high cost stays low (about 5–15%) until
+  the late 50s, then rises fast after 60.
+- The straight-line model (M2) cannot bend like this. Its highest chance for
+  any non-smoker is only `r percent(max(nonsmokers$p_linear), 0.1)`, so it
+  says "high cost" for only `r sum(nonsmokers$p_linear >= 0.5)` of the
+  `r comma(nrow(nonsmokers))` non-smokers.
+- The final model (M5) follows the jump at older ages, so it flags
+  `r sum(nonsmokers$p_final >= 0.5)` non-smokers, all aged
+  `r min(nonsmokers$age[nonsmokers$p_final >= 0.5])` or older. This is where
+  its extra accuracy comes from.
+
+### 7.3 Performance on new data (10-fold CV)
+
+All numbers here come from the out-of-fold predictions in section 6, so the
+model never saw the people it is scored on.
+
+```{r plot-roc, fig.width = 5.5, fig.height = 5.5}
+final_pred <- cv_pred[["M5 Stepwise AIC"]]
+roc_final  <- roc(actual, final_pred, levels = c(0, 1), direction = "<", quiet = TRUE)
+ci.auc(roc_final)
+
+ggroc(roc_final, legacy.axes = TRUE, colour = "#D1495B", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  coord_equal() +
+  labs(title = sprintf("Final model ROC (10-fold CV), AUC = %.3f", auc(roc_final)),
+       x = "False positive rate (1 - specificity)",
+       y = "True positive rate (sensitivity)")
+```
+
+```{r confusion-matrix}
+predicted <- factor(ifelse(final_pred >= 0.5, "Yes", "No"), levels = c("No", "Yes"))
+confusion <- table(Predicted = predicted, Actual = ins$high_cost)
+confusion
+
+tp <- confusion["Yes", "Yes"]; tn <- confusion["No", "No"]
+fp <- confusion["Yes", "No"];  fn <- confusion["No", "Yes"]
+
+data.frame(
+  metric = c("Accuracy",
+             "Sensitivity (share of high-cost people we find)",
+             "Specificity (share of low-cost people we find)",
+             "Precision (share of 'Yes' predictions that are right)"),
+  value  = percent(c((tp + tn) / sum(confusion), tp / (tp + fn),
+                     tn / (tn + fp), tp / (tp + fp)), 0.1)
+)
+```
+
+Who are the high-cost people that the model misses?
+
+```{r missed-people}
+missed <- ins %>% filter(predicted == "No", high_cost == "Yes")
+missed %>% count(smoker, age_group = ifelse(age >= 60, "60+", "under 60"))
+```
+
+- The model is right for `r percent((tp + tn) / sum(confusion), 0.1)` of people
+  (baseline: 70%) and almost never calls a low-cost person "high cost"
+  (only `r fp` of `r tn + fp`).
+- Of the `r fn` high-cost people it misses,
+  `r sum(missed$smoker == "no" & missed$age < 60)` are non-smokers under 60.
+  They are the small group from 4.8 that is expensive for reasons that are
+  **not in the data**, so they are very hard to find with these 6 columns.
+
+## 8. Key findings
+
+1. **Smoking is by far the strongest factor.**
+   `r sum(ins$smoker == "yes" & ins$high_cost == "Yes")` of
+   `r sum(ins$smoker == "yes")` smokers are high cost, compared with
+   `r percent(mean(ins$high_cost[ins$smoker == "no"] == "Yes"), 0.1)` of
+   non-smokers.
+2. **Age matters in a curved way.** For non-smokers, the risk is low until
+   the late 50s and rises fast after 60. Models with age² and age³ beat the
+   straight-line models.
+3. **More children means a higher risk** (odds × `r round(or_table["children", 1], 2)`
+   per child), and the **southwest has a lower risk** than the northeast.
+4. **Sex does not have a clear effect**, and BMI has only a small effect on
+   this yes/no target.
+5. The **final model (M5, stepwise AIC)** has the lowest AIC among the models
+   that converge and a CV accuracy of `r percent((tp + tn) / sum(confusion), 0.1)`
+   with an AUC of `r round(as.numeric(auc(roc_final)), 3)`.
+6. The full model with smoker interactions **cannot be fitted** (separation),
+   because only 2 smokers are not high cost.
+
+## 9. Limitations and next steps
+
+- **A yes/no target loses information.** For example, BMI changes smokers'
+  charges a lot (median
+  $`r comma(median(ins$charges[ins$smoker == "yes" & ins$bmi >= 30]))` with a
+  BMI of 30 or more vs
+  $`r comma(median(ins$charges[ins$smoker == "yes" & ins$bmi < 30]))` below 30),
+  but almost all smokers are already above the cutoff, so the model cannot see
+  this. *Next step:* model `charges` directly, for example with a Gamma GLM
+  with a log link.
+- **Separation.** Smoking almost perfectly predicts high cost, so smoker
+  interactions cannot be estimated and the smoker odds ratio is very uncertain.
+  *Next step:* Firth's penalized logistic regression (`logistf`) or LASSO
+  (`glmnet`).
+- **Variable selection uses the same data.** Stepwise and best subset
+  selection make p-values look better than they are. In our CV, the formula
+  was chosen once on all data (the selection was not repeated inside each
+  fold), so the CV scores may be a little optimistic. *Next step:* nested CV.
+- **Missing information.** Only 6 predictors, and some non-smokers are
+  expensive at any age for reasons that are not in the data.
+- **No external test data.** All results come from one dataset of
+  `r comma(nrow(ins))` people.
+
+## 10. Session info
+
+```{r session-info}
+sessionInfo()
+```
